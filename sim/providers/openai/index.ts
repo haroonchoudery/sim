@@ -1,4 +1,5 @@
 import OpenAI from 'openai'
+import { createAutoblocksTracer } from '@/lib/autoblocks/client'
 import { createLogger } from '@/lib/logs/console-logger'
 import { executeTool } from '@/tools'
 import { ProviderConfig, ProviderRequest, ProviderResponse, TimeSegment } from '../types'
@@ -25,6 +26,40 @@ export const openaiProvider: ProviderConfig = {
       toolCount: request.tools?.length || 0,
       hasResponseFormat: !!request.responseFormat,
     })
+
+    // Start execution timer for the entire provider execution
+    const providerStartTime = Date.now()
+    const providerStartTimeISO = new Date(providerStartTime).toISOString()
+
+    // Initialize Autoblocks tracer
+    logger.info('Creating Autoblocks tracer for OpenAI request', {
+      hasApiKey: !!process.env.AUTOBLOCKS_API_KEY,
+    })
+
+    const tracer = createAutoblocksTracer(undefined, {
+      provider: 'openai',
+      model: request.model || 'gpt-4o',
+      timestamp: providerStartTimeISO,
+    })
+    logger.info('Successfully created Autoblocks tracer')
+
+    // Test the tracer connection
+    try {
+      await tracer.sendEvent('openai.request.start', {
+        properties: {
+          timestamp: providerStartTimeISO,
+          model: request.model || 'gpt-4o',
+          hasSystemPrompt: !!request.systemPrompt,
+          messageCount: request.messages?.length || 0,
+          toolCount: request.tools?.length || 0,
+        },
+      })
+      logger.info('Successfully sent initial event to Autoblocks')
+    } catch (error) {
+      logger.error('Failed to send initial event to Autoblocks', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
 
     // API key is now handled server-side before this function is called
     const openai = new OpenAI({ apiKey: request.apiKey })
@@ -77,35 +112,39 @@ export const openaiProvider: ProviderConfig = {
 
     // Add response format for structured output if specified
     if (request.responseFormat) {
-      // Use OpenAI's JSON schema format
       payload.response_format = {
         type: 'json_schema',
-        json_schema: {
-          name: request.responseFormat.name || 'response_schema',
-          schema: request.responseFormat.schema || request.responseFormat,
-          strict: request.responseFormat.strict !== false,
-        },
+        schema: request.responseFormat.schema || request.responseFormat,
       }
-
-      logger.info('Added JSON schema response format to request')
     }
 
     // Add tools if provided
     if (tools?.length) {
       payload.tools = tools
       payload.tool_choice = 'auto'
-      logger.info(`Configured ${tools.length} tools for OpenAI request`)
     }
 
-    // Start execution timer for the entire provider execution
-    const providerStartTime = Date.now()
-    const providerStartTimeISO = new Date(providerStartTime).toISOString()
+    // Track request with Autoblocks
+    const spanId = crypto.randomUUID()
+    tracer.sendEvent('ai.request', {
+      spanId: spanId,
+      properties: payload,
+    })
 
     try {
       // Make the initial API request
       const initialCallTime = Date.now()
       let currentResponse = await openai.chat.completions.create(payload)
       const firstResponseTime = Date.now() - initialCallTime
+
+      // Track response with Autoblocks
+      tracer.sendEvent('ai.response', {
+        spanId: spanId,
+        properties: {
+          response: JSON.parse(JSON.stringify(currentResponse)),
+          latency_ms: firstResponseTime,
+        },
+      })
 
       let content = currentResponse.choices[0]?.message?.content || ''
       let tokens = {
@@ -158,6 +197,16 @@ export const openaiProvider: ProviderConfig = {
             const tool = request.tools?.find((t) => t.id === toolName)
             if (!tool) continue
 
+            // Track tool call with Autoblocks
+            const toolSpanId = crypto.randomUUID()
+            tracer.sendEvent('ai.tool.request', {
+              spanId: toolSpanId,
+              properties: {
+                tool: toolName,
+                arguments: toolArgs,
+              },
+            })
+
             // Execute the tool
             const toolCallStartTime = Date.now()
             const mergedArgs = {
@@ -168,6 +217,17 @@ export const openaiProvider: ProviderConfig = {
             const result = await executeTool(toolName, mergedArgs)
             const toolCallEndTime = Date.now()
             const toolCallDuration = toolCallEndTime - toolCallStartTime
+
+            // Track tool result with Autoblocks
+            tracer.sendEvent('ai.tool.response', {
+              spanId: toolSpanId,
+              properties: {
+                tool: toolName,
+                success: result.success,
+                output: result.output,
+                duration_ms: toolCallDuration,
+              },
+            })
 
             if (!result.success) continue
 
@@ -216,6 +276,16 @@ export const openaiProvider: ProviderConfig = {
               error,
               toolName: toolCall?.function?.name,
             })
+
+            // Track tool error with Autoblocks
+            tracer.sendEvent('ai.tool.error', {
+              spanId: spanId,
+              properties: {
+                tool: toolCall?.function?.name,
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack : undefined,
+              },
+            })
           }
         }
 
@@ -232,11 +302,27 @@ export const openaiProvider: ProviderConfig = {
         // Time the next model call
         const nextModelStartTime = Date.now()
 
+        // Track follow-up request with Autoblocks
+        const followUpSpanId = crypto.randomUUID()
+        tracer.sendEvent('ai.request', {
+          spanId: followUpSpanId,
+          properties: nextPayload,
+        })
+
         // Make the next request
         currentResponse = await openai.chat.completions.create(nextPayload)
 
         const nextModelEndTime = Date.now()
         const thisModelTime = nextModelEndTime - nextModelStartTime
+
+        // Track follow-up response with Autoblocks
+        tracer.sendEvent('ai.response', {
+          spanId: followUpSpanId,
+          properties: {
+            response: JSON.parse(JSON.stringify(currentResponse)),
+            latency_ms: thisModelTime,
+          },
+        })
 
         // Add to time segments
         timeSegments.push({
@@ -288,26 +374,21 @@ export const openaiProvider: ProviderConfig = {
         },
       }
     } catch (error) {
-      // Include timing information even for errors
-      const providerEndTime = Date.now()
-      const providerEndTimeISO = new Date(providerEndTime).toISOString()
-      const totalDuration = providerEndTime - providerStartTime
-
-      logger.error('Error in OpenAI request:', {
-        error,
-        duration: totalDuration,
+      logger.error('Error in OpenAI request', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        model: request.model,
       })
 
-      // Create a new error with timing information
-      const enhancedError = new Error(error instanceof Error ? error.message : String(error))
-      // @ts-ignore - Adding timing property to the error
-      enhancedError.timing = {
-        startTime: providerStartTimeISO,
-        endTime: providerEndTimeISO,
-        duration: totalDuration,
-      }
+      // Track error with Autoblocks
+      tracer.sendEvent('ai.error', {
+        spanId: spanId,
+        properties: {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+      })
 
-      throw enhancedError
+      throw error
     }
   },
 }

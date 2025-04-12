@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 services:
   simstudio:
@@ -33,7 +33,7 @@ services:
     image: postgres:16
     restart: always
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -47,7 +47,7 @@ services:
       retries: 5
 
   local-llm-gpu:
-    profiles: 
+    profiles:
       - local-gpu # This profile requires both 'local' and 'gpu'
     image: ollama/ollama:latest
     pull_policy: always

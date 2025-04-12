@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@autoblocks/client": "^0.0.94",
+    "drizzle-kit": "^0.30.6",
+    "drizzle-orm": "^0.41.0"
+  }
+}

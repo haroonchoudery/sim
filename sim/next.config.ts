@@ -1,10 +1,19 @@
 import type { NextConfig } from 'next'
+import path from 'path'
+import webpack from 'webpack'
 
 // Check if we're building for standalone distribution
 const isStandaloneBuild = process.env.USE_LOCAL_STORAGE === 'true'
 
 const nextConfig: NextConfig = {
   devIndicators: false,
+  // Expose environment variables to the browser
+  env: {
+    AUTOBLOCKS_INGESTION_KEY: process.env.AUTOBLOCKS_INGESTION_KEY,
+  },
+  publicRuntimeConfig: {
+    AUTOBLOCKS_INGESTION_KEY: process.env.AUTOBLOCKS_INGESTION_KEY,
+  },
   images: {
     domains: [
       'avatars.githubusercontent.com',
@@ -24,6 +33,56 @@ const nextConfig: NextConfig = {
         type: 'memory',
         maxGenerations: 1,
       }
+    }
+
+    // Add support for ESM packages
+    config.resolve.extensionAlias = {
+      '.js': ['.js', '.ts', '.tsx', '.jsx'],
+      '.mjs': ['.mjs', '.mts'],
+      '.cjs': ['.cjs', '.cts'],
+    }
+
+    if (!isServer) {
+      // Handle node: protocol imports
+      config.resolve.alias = {
+        ...config.resolve.alias,
+        'node:async_hooks': false,
+        '@opentelemetry/api': require.resolve('@opentelemetry/api'),
+        '@opentelemetry/core': require.resolve('@opentelemetry/core'),
+        '@opentelemetry/semantic-conventions': require.resolve(
+          '@opentelemetry/semantic-conventions'
+        ),
+        '@opentelemetry/resources': require.resolve('@opentelemetry/resources'),
+      }
+
+      // Provide fallbacks for Node.js built-in modules in the browser
+      config.resolve.fallback = {
+        ...config.resolve.fallback,
+        fs: false,
+        net: false,
+        tls: false,
+        async_hooks: false,
+        crypto: require.resolve('crypto-browserify'),
+        stream: require.resolve('stream-browserify'),
+        http: require.resolve('stream-http'),
+        https: require.resolve('https-browserify'),
+        os: require.resolve('os-browserify/browser'),
+        url: require.resolve('url/'),
+        assert: require.resolve('assert/'),
+        buffer: require.resolve('buffer/'),
+      }
+
+      // Add polyfills
+      config.plugins.push(
+        new webpack.ProvidePlugin({
+          process: 'process/browser',
+          Buffer: ['buffer', 'Buffer'],
+        }),
+        new webpack.NormalModuleReplacementPlugin(
+          /node:async_hooks/,
+          path.resolve(__dirname, 'lib/polyfills/async_hooks.ts')
+        )
+      )
     }
 
     return config
@@ -81,6 +140,13 @@ const nextConfig: NextConfig = {
           ]
         },
       }),
+  transpilePackages: [
+    '@autoblocks/client',
+    '@opentelemetry/api',
+    '@opentelemetry/core',
+    '@opentelemetry/semantic-conventions',
+    '@opentelemetry/resources',
+  ],
 }
 
 export default nextConfig
